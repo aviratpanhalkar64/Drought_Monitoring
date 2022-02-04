@@ -1,0 +1,573 @@
+//=====================================================================================================
+//                     DROUGHT MONITORING USING THE STANDARDIZED VEGETATION INDEX (SVI)
+//=====================================================================================================
+var MOD13Q1_imageCollection:
+var SviVis: SVI from -2.5 to 2.5
+var EviVis: EVI_Masked from 0 to 0.4
+var Mean EviVis: EVI_Masked from 0 to 0.4
+// Use the polygon-tool in the top left corner of the map pane to draw the shape of your 
+// study area. Single clicks add vertices, double-clicking completes the polygon.
+var AOI:FeatureCollection
+
+//=====================================================================================================
+//                             SELECT YOUR OWN STUDY AREA   
+
+ Map.setCenter(39, 10, 9);
+var start_date = ee.Date(ee.List(MOD13Q1_imageCollection.get('date_range')).get(0)).advance(-1,'day');
+var end_date = ee.Date(ee.List(MOD13Q1_imageCollection.get('date_range')).get(1)).advance(+1,'day');
+print('The observed time period begins on ', start_date.advance(+1,'day').format('YYYY-MM-dd'),'and ends on ', end_date.advance(-1,'day').format('YYYY-MM-dd'));
+
+//                                 SET TIME FRAME FOR EXPORT
+//As exporting all images over the whole investigation period might cause issues, a reduction of the
+//images to be exported is advisable. You can change the start and end point for the export selection 
+//below. The images will be added to the 'Tasks' tab.
+
+var startDateForDownload = '2019-06-01';
+var endDateForDownload = end_date;
+
+//=====================================================================================================
+//                                     SET RESOLUTION
+//MODIS Vegetation Indices have a resolution of 250 meter. Depending on the size of your AOI it might
+
+var resolution = 500; //the resolution might be increased up to 250 depending on the AOI size
+
+//=====================================================================================================
+//                                    INTERACTIVE CHART
+var showInteractiveChart = true; //set to "true" if you want to use the interactive chart. Otherwise set to "false"
+
+//=====================================================================================================
+//                                   SVI IMAGES
+//Filter for images with highest and lowest SVI mean. If set to "true", images with highest and lowest 
+//SVI mean will be calculated. The images will be added to the 'Tasks'.
+
+var filterWorstBestSVI = false;
+var amountWorstBestImages = 3; //Amount of hits for highest and lowest SVI mean. 3 = worst 3 images and best 3 images
+var maxPixels = 1e9; //Number of pixels that will be recognised for statistics. If actual number of pixels is higher, the SVI mean will not depict the mean of all pixels
+//************************************************************************************************* 
+
+
+//                                  START OF THE SCRIPT
+
+//Add MODIS Data
+var evi = MOD13Q1_imageCollection.select(['EVI', 'SummaryQA'])
+  .filterDate(start_date, end_date)
+  .filterBounds(AOI)
+  .map(function(image){return image.clip(AOI)});
+  
+  
+//Create Quality Masks. You can change the code and use the 'DetailedQA' for a better masking.
+var QualityMask = evi.map(function(QA){
+  var intermediateMask = QA.select(['SummaryQA'],['QA_Mask']);
+  var mask = (intermediateMask.eq(2).max(intermediateMask.eq(3))).not();
+  return QA.addBands(mask);
+});
+
+//Apply Masks
+var MaskImages = QualityMask.map(function(Masking){
+  var SelectImageForMask = Masking.select(['EVI'], ['EVI_Masked']);
+  var SelectMask = Masking.select(['QA_Mask']);
+  var ApplyMask = SelectImageForMask.updateMask(SelectMask);
+  return ApplyMask.addBands(Masking);
+});
+
+//*************************************************************************************************
+//Calculate statistics and SVI
+
+  //Rescale EVI data range to -1, 1
+var rescaledEVIRange = MaskImages.map(function(rescale){
+  var recalculated = rescale.expression('evi / divider',
+  {
+    evi: rescale.select('EVI_Masked'),
+    divider: 10000
+  })
+  return rescale.addBands({
+    srcImg: recalculated,
+    overwrite: true
+  })
+})
+
+
+  //Select band that will be used for SVI calculation
+var SelectImageForStats = rescaledEVIRange.select(['EVI_Masked']);
+
+
+//Calculate statistics for each image
+var statsCollection = SelectImageForStats.map(function(stats){
+  var startDOY = ee.Date(stats.get('system:time_start')).getRelative('day', 'year');
+  var endDOY = ee.Date(stats.get('system:time_end')).getRelative('day', 'year');
+  var collectionForStats = SelectImageForStats
+    .filter(ee.Filter.calendarRange(startDOY, endDOY, 'day_of_year'))
+    .reduce(ee.Reducer.stdDev().combine(ee.Reducer.mean(), null, true));
+  return stats.addBands(collectionForStats);
+});
+
+//Calculate SVI
+var FinalCollection = statsCollection.map(function(toSVI){
+  var SelectImageForSVI = toSVI.select(['EVI_Masked'], ['SVI']);
+  var calc = toSVI.expression('(evi - mean) / stdDev', 
+  {
+    evi: SelectImageForSVI, 
+    mean: toSVI.select('EVI_Masked_mean'), 
+    stdDev: toSVI.select('EVI_Masked_stdDev')});
+  return toSVI
+    .addBands(calc)
+    .set({
+      startDate: ee.Date(toSVI.get('system:time_start')).format('YYYY_MM_dd_DD'),
+      endDate: ee.Date(toSVI.get('system:time_end')).format('YYYY_MM_dd_DD')
+    });
+});
+
+//************************************************************************************************* 
+//Display Data
+Map.centerObject(AOI, 7); //Center map view to AOI
+
+var selectEviForMean = FinalCollection.select(['EVI_Masked']);
+var Mean_EVI = selectEviForMean.mean();
+
+//Map.addLayer(FinalCollection.first(), MaskVis, 'Quality Mask', false);
+Map.addLayer(Mean_EVI, MeanEviVis, 'Mean EVI', false);
+  //filters the latest image from image collection by the given end date. The given Name uses the end date as well
+var imageToVisualize = FinalCollection.limit(1, 'system:time_start', false).first();
+var imageStartDate = imageToVisualize.get('startDate');
+var imageEndDate = imageToVisualize.get('endDate');
+Map.addLayer(imageToVisualize, EviVis, 'EVI '+imageStartDate.getInfo()+' to '+imageEndDate.getInfo(), false);
+Map.addLayer(imageToVisualize, SviVis, 'SVI '+imageStartDate.getInfo()+' to '+imageEndDate.getInfo());
+//************************************************************************************************* 
+//Create a chart of SVI and EVI over time
+//Add labels to AOI feature collection. Labels will be used for the charts
+var RoiWithLabels = AOI.map(function(addLabels){
+  var labelNames = addLabels.set('labelEVI','EVI').set('labelSVI', 'SVI');
+  return labelNames;
+});
+
+//Plot SVI Chart
+var SVI_Chart = ui.Chart.image.seriesByRegion(
+  FinalCollection, 
+  RoiWithLabels, 
+  ee.Reducer.mean(),
+  'SVI', 
+  resolution, //Scale in meter
+  'system:time_start', 
+  'labelSVI' //label
+  ).setOptions({
+    title: 'SVI Time Series (based on EVI)',
+    vAxis: {title: 'SVI'},
+    hAxis: {title: 'Year'},
+    //legend: {position: 'none'},
+    });
+    
+print('SVI chart based on mean values within AOI:',SVI_Chart);
+
+//Plot  EVI Chart
+var EVI_Chart = ui.Chart.image.seriesByRegion(
+  FinalCollection, //Image collection to be used
+  RoiWithLabels, //Region that will be observed in Chart
+  ee.Reducer.mean(), //Reducer type
+  'EVI_Masked', //Band to be used
+  resolution, //Scale in meter
+  'system:time_start', 
+  'labelEVI' //label
+  ).setOptions({
+    title: 'EVI Time Series',
+    vAxis: {title: 'EVI'},
+    hAxis: {title: 'Year'},
+    //legend: {position: 'none'},
+});
+print('EVI chart based on mean values within AOI:',EVI_Chart);
+
+//*************************************************************************************************
+//Inspector Chart
+// Create a panel to hold the chart.
+if (showInteractiveChart === true){
+  var inspectorPanel = ui.Panel({
+    style:{
+      width: '400px',
+      position: 'bottom-right'
+    }
+  });
+  Map.add(inspectorPanel);
+  
+  // Register a function to draw a chart when a user clicks on the map.
+  Map.onClick(function(coords) {
+  inspectorPanel.clear();
+  var point = ee.FeatureCollection(ee.Geometry.Point(coords.lon, coords.lat)).map(function(addLabels){
+  var labelNames = addLabels.set('labelSVI', 'SVI');
+  return labelNames;
+});
+  
+    //Button to hide Panel once the chart is loaded
+  var hideButton = ui.Button({
+    label: 'X',
+    onClick: function(){
+      inspectorPanel.clear();
+    },
+    style:{
+      color: 'red',
+    }
+  });
+  inspectorPanel.add(hideButton);
+  
+    //Chart to display data history of clicked point
+  var inspectorChart = ui.Chart.image.seriesByRegion(  FinalCollection, 
+  point, 
+  ee.Reducer.mean(),
+  'SVI', 
+  resolution, //Scale in meter
+  'system:time_start', 
+  'labelSVI' //label
+  ).setOptions({
+    title: 'SVI Time Series (based on EVI)',
+    vAxis: {title: 'SVI'},
+    hAxis: {title: 'Year'},
+    //legend: {position: 'none'},
+    });
+  inspectorChart.setOptions({title: 'SVI for requested pixel'});
+  inspectorPanel.add(inspectorChart);
+  
+
+  
+  });
+}
+
+//************************************************************************************************* 
+//Create title
+//Add Title
+var title = ui.Label({
+  value: 'Eastern Tigray Zone: Drought monitoring using the Standard Vegetation Index (SVI)',
+  style:{
+  fontWeight: 'bold',
+  fontSize: '18px'
+  }});
+title.style().set('position', 'top-center');
+Map.add(title);
+
+//Create legend
+
+//Get Max and Min values from imports-section with one decimal 
+var getSviVisMax = Math.round(SviVis.max*10)/10;
+var getSviVisMin = Math.round(SviVis.min*10)/10;
+
+var getEviVisMax = Math.round(EviVis.max*10)/10;
+var getEviVisMin = Math.round(EviVis.min*10)/10;
+
+var getEviMeanVisMax = Math.round(MeanEviVis.max*10)/10;
+var getEviMeanVisMin = Math.round(MeanEviVis.min*10)/10;
+
+//Create Colorramp information
+var vizSVI = {min: getSviVisMin, max:getSviVisMax, palette:SviVis.palette};
+var vizEVI = {min: getEviVisMin, max:getEviVisMax, palette:EviVis.palette};
+var vizMeanEVI = {min: getEviMeanVisMin, max:getEviMeanVisMax, palette:MeanEviVis.palette};
+
+//Add main panel which will contain smaller panels for each legend (SVI, EVI, Mean EVI)
+    var mainPanel = ui.Panel({
+      layout: ui.Panel.Layout.flow('horizontal'),
+      style: {
+        position: 'bottom-left',
+        padding: '8px 15px'
+      }
+    });
+
+//Add SVI Legend
+          //Add new panel for SVI legend within the main Panel
+        var sviLegend = ui.Panel({
+          style: {
+             //position: 'bottom-left',
+             padding: '0 0'
+           }
+        });
+        mainPanel.add(sviLegend);
+          
+         //Create a checkbox which will enable a toggle function to show the SVI legend
+        var sviCheckbox = ui.Checkbox('Show SVI Legend', false);
+          //Provide information what happens if the checkbox is checked or unchecked
+        sviCheckbox.onChange(function(checked) {
+          if (checked) { //if it is checked, fill the SVI legend panel with information
+              //Create legend title
+              var sviLegendTitle = ui.Label({
+                value: 'SVI',
+                style: {
+                  fontWeight: 'bold',
+                  fontSize: '18px',
+                  margin: '0 auto',
+                  padding: '0 auto'
+                  }
+              });
+              
+               // Add the title to the panel
+              sviLegend.add(sviLegendTitle);
+              
+              // create the legend image
+              var sviLon = ee.Image.pixelLonLat().select('latitude');
+              var sviGradient = sviLon.multiply((vizSVI.max-vizSVI.min)/100.0).add(vizSVI.min);
+              var sviLegendImage = sviGradient.visualize(vizSVI);
+              
+              // create text on top of legend
+              var sviPanelMax = ui.Panel({
+                  widgets: [
+                    ui.Label(vizSVI['max'])
+                  ],
+                  style: {
+                    padding: '0 auto',
+                    margin: '0 auto',
+                    position: 'bottom-center'
+                  }
+                });
+              
+              sviLegend.add(sviPanelMax);
+                
+              // create thumbnail from the image
+              var sviThumbnail = ui.Thumbnail({
+                image: sviLegendImage, 
+                params: {bbox:'0,0,10,100', dimensions:'10x150'},  
+                style: {
+                    padding: '0 auto',
+                    margin: '0 auto',
+                    position: 'bottom-center'
+                  }
+              });
+              
+              // add the thumbnail to the legend
+              sviLegend.add(sviThumbnail);
+              
+              // create text on top of legend
+              var sviPanelMin = ui.Panel({
+                  widgets: [
+                    ui.Label(vizSVI['min'])
+                  ],
+                  style: {
+                    padding: '0 auto',
+                    margin: '0 auto',
+                    position: 'bottom-center'
+                  }
+                  });
+              
+              sviLegend.add(sviPanelMin);
+        
+        
+          } else {
+            sviLegend.clear();
+          }
+        });
+        print(sviCheckbox);
+//Add EVI Legend
+        //Add new panel for SVI legend within the main Panel
+        var eviLegend = ui.Panel({
+          style: {
+             //position: 'bottom-left',
+             padding: '0 0'
+           }
+        });
+        mainPanel.add(eviLegend);
+          
+          //Create a checkbox which will enable a toggle function to show the SVI legend
+        var eviCheckbox = ui.Checkbox('Show EVI Legend', false);
+          //Provide information what happens if the checkbox is checked or unchecked
+        eviCheckbox.onChange(function(checked) {
+          if (checked) { //if it is checked, fill the SVI legend panel with information
+              //Create legend title
+              var eviLegendTitle = ui.Label({
+                value: 'EVI',
+                style: {
+                  fontWeight: 'bold',
+                  fontSize: '18px',
+                  margin: '0 auto',
+                  padding: '0 auto'
+                  }
+              });
+              
+               // Add the title to the panel
+              eviLegend.add(eviLegendTitle);
+              
+              // create the legend image
+              var eviLon = ee.Image.pixelLonLat().select('latitude');
+              var eviGradient = eviLon.multiply((vizEVI.max-vizEVI.min)/100.0).add(vizEVI.min);
+              var eviLegendImage = eviGradient.visualize(vizEVI);
+              
+              // create text on top of legend
+              var eviPanelMax = ui.Panel({
+                  widgets: [
+                    ui.Label(vizEVI['max'])
+                  ],
+                  style: {
+                    padding: '0 auto',
+                    margin: '0 auto',
+                    position: 'bottom-center'
+                  }
+                });
+              
+              eviLegend.add(eviPanelMax);
+                
+              // create thumbnail from the image
+              var eviThumbnail = ui.Thumbnail({
+                image: eviLegendImage, 
+                params: {bbox:'0,0,10,100', dimensions:'10x150'},  
+                  style: {
+                    padding: '0 auto',
+                    margin: '0 auto',
+                    position: 'bottom-center'
+                  }
+              });
+              
+              // add the thumbnail to the legend
+              eviLegend.add(eviThumbnail);
+              
+              // create text on top of legend
+              var eviPanelMin = ui.Panel({
+                  widgets: [
+                    ui.Label(vizEVI['min'])
+                  ],
+                  style: {
+                    padding: '0 auto',
+                    margin: '0 auto',
+                    position: 'bottom-center'
+                  }
+                });
+              
+              eviLegend.add(eviPanelMin);
+        
+        
+          } else {
+            eviLegend.clear();
+          }
+        });
+        print(eviCheckbox);
+
+//Add Mean EVI Legend
+        //Add new panel for Mean EVI legend within the main Panel
+        var meanEviLegend = ui.Panel({
+          style: {
+             //position: 'bottom-left',
+             padding: '0 0'
+           }
+        });
+        mainPanel.add(meanEviLegend);
+          
+          //Create a checkbox which will enable a toggle function to show the SVI legend
+        var meanEviCheckbox = ui.Checkbox('Show Mean EVI Legend', false);
+          //Provide information what happens if the checkbox is checked or unchecked
+        meanEviCheckbox.onChange(function(checked) {
+          if (checked) { //if it is checked, fill the SVI legend panel with information
+              //Create legend title
+              var meanEviLegendTitle = ui.Label({
+                value: 'Mean EVI',
+                style: {
+                  fontWeight: 'bold',
+                  fontSize: '18px',
+                  margin: '0 auto',
+                  padding: '0 auto'
+                  }
+              });
+              
+               // Add the title to the panel
+              meanEviLegend.add(meanEviLegendTitle);
+              
+              // create the legend image
+              var meanEviLon = ee.Image.pixelLonLat().select('latitude');
+              var meanEviGradient = meanEviLon.multiply((vizMeanEVI.max-vizMeanEVI.min)/100.0).add(vizMeanEVI.min);
+              var MeanEviLegendImage = meanEviGradient.visualize(vizMeanEVI);
+              
+              // create text on top of legend
+              var meanEviPanelMax = ui.Panel({
+                  widgets: [
+                    ui.Label(vizMeanEVI['max'])
+                  ],
+                  style: {
+                    padding: '0 auto',
+                    margin: '0 auto',
+                    position: 'bottom-center'
+                  }
+                });
+              
+              meanEviLegend.add(meanEviPanelMax);
+                
+              // create thumbnail from the image
+              var meanEviThumbnail = ui.Thumbnail({
+                image: MeanEviLegendImage, 
+                params: {bbox:'0,0,10,100', dimensions:'10x150'},  
+                  style: {
+                    padding: '0 auto',
+                    margin: '0 auto',
+                    position: 'bottom-center'
+                  }
+              });
+              
+              // add the thumbnail to the legend
+              meanEviLegend.add(meanEviThumbnail);
+              
+              // create text on top of legend
+              var meanEviPanelMin = ui.Panel({
+                  widgets: [
+                    ui.Label(vizMeanEVI['min'])
+                  ],
+                  style: {
+                    padding: '0 auto',
+                    margin: '0 auto',
+                    position: 'bottom-center'
+                  }
+                });
+              
+              meanEviLegend.add(meanEviPanelMin);
+        
+        
+          } else {
+            meanEviLegend.clear();
+          }
+        });
+        print(meanEviCheckbox);
+
+Map.add(mainPanel);
+//Calculates the SVI mean of every image and filters for the worst and best SVI mean
+if (filterWorstBestSVI ===  true) {
+  //Calculate the mean of the SVI for each image in image collection
+  var sviMeanCollection = FinalCollection.map(function(toSVImean){
+    var calculateSviMean = ee.Number(toSVImean.select(['SVI']).reduceRegion({
+      reducer: ee.Reducer.mean(),
+      geometry: AOI,
+      scale: resolution,
+      bestEffort: true,
+      maxPixels: maxPixels 
+    }).values().get(0));
+  //Gives the SVI mean value back to the properties of each image
+  return toSVImean.set({
+    SVI_Mean: calculateSviMean
+  });
+  });
+  
+  //Sort and select for the highest and lowest SVI mean
+  var selectLowest =  sviMeanCollection.limit(amountWorstBestImages, 'SVI_Mean');
+  print(amountWorstBestImages+' images with lowest SVI mean ',selectLowest);
+  var selectHighest =  sviMeanCollection.limit(amountWorstBestImages, 'SVI_Mean', false);
+  print(amountWorstBestImages+' images with highest SVI mean ',selectHighest);
+  
+  //Add image with the highest and lowest SVI to the map
+  Map.addLayer(selectLowest.first(), SviVis, 'SVI with lowest mean '+selectLowest.first().get('startDate').getInfo()+' to '+selectLowest.first().get('endDate').getInfo(), false);
+  Map.addLayer(selectHighest.first(), SviVis, 'SVI with highest mean '+selectHighest.first().get('startDate').getInfo()+' to '+selectHighest.first().get('endDate').getInfo(), false);
+  
+  //Add the requested amount of images with highest and lowest SVI to dowload list
+  var batch = require('users/fitoprincipe/geetools:batch');
+  batch.Download.ImageCollection.toDrive(selectLowest, "SVI_ImageCollection",{
+    name: 'Lowest_SVI_{startDate}-{endDate}',
+    scale: resolution,
+    region: AOI
+  });
+  batch.Download.ImageCollection.toDrive(selectHighest, "SVI_ImageCollection",{
+    name: 'Highest_SVI_{startDate}-{endDate}',
+    scale: resolution,
+    region: AOI
+  });
+}
+print('Final Image Collection:', FinalCollection);
+//Add exports to tasks tab
+var batch = require('users/fitoprincipe/geetools:batch');
+var ImageCollectionForExport = FinalCollection.select(['SVI']).filterDate(startDateForDownload, endDateForDownload);
+print('Selected Images for Export',ImageCollectionForExport);
+
+batch.Download.ImageCollection.toDrive(ImageCollectionForExport, "SVI_ImageCollection",{
+  name: 'SVI_{startDate}-{endDate}',
+  scale: resolution,
+  region: AOI
+});
+
+
+
+
